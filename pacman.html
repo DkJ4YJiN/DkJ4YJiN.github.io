@@ -1,0 +1,1321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>PAC-MAN</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;color:#6f77a8;font-family:"Courier New",monospace}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center}
+  canvas{display:block;width:min(100vw,calc((100vh - 28px) * 448 / 576));height:auto;background:#000;touch-action:none;outline:none;cursor:pointer}
+  #help{font-size:12px;height:28px;line-height:28px;letter-spacing:1px;white-space:nowrap;text-align:center}
+</style>
+</head>
+<body>
+<canvas id="game" width="448" height="576" tabindex="0"></canvas>
+<div id="help">ARROWS / WASD MOVE &nbsp;·&nbsp; P PAUSE &nbsp;·&nbsp; SPACE TELEPORT &nbsp;·&nbsp; M MUTE &nbsp;·&nbsp; ENTER START</div>
+<script>
+(() => {
+'use strict';
+
+/* =====================================================================
+   CONSTANTS & MAZE
+   ===================================================================== */
+const T = 16, COLS = 28, ROWS = 31, HUD_TOP = 3, HUD_BOT = 2;
+const W = COLS * T, H = (ROWS + HUD_TOP + HUD_BOT) * T, OFFY = HUD_TOP * T;
+const SCALE = Math.min(3, Math.max(2, Math.ceil(window.devicePixelRatio || 1)));
+const TUNNEL_ROW = 14;
+const BASE_SPEED = 9.2;                 // tiles / second at "100%"
+
+const MAZE = [
+"############################",
+"#............##............#",
+"#.####.#####.##.#####.####.#",
+"#o####.#####.##.#####.####o#",
+"#.####.#####.##.#####.####.#",
+"#..........................#",
+"#.####.##.########.##.####.#",
+"#.####.##.########.##.####.#",
+"#......##....##....##......#",
+"######.##### ## #####.######",
+"     #.##### ## #####.#     ",
+"     #.##          ##.#     ",
+"     #.## ###--### ##.#     ",
+"######.## #      # ##.######",
+"      .   #      #   .      ",
+"######.## #      # ##.######",
+"     #.## ######## ##.#     ",
+"     #.##          ##.#     ",
+"     #.## ######## ##.#     ",
+"######.## ######## ##.######",
+"#............##............#",
+"#.####.#####.##.#####.####.#",
+"#.####.#####.##.#####.####.#",
+"#o..##.......  .......##..o#",
+"###.##.##.########.##.##.###",
+"###.##.##.########.##.##.###",
+"#......##....##....##......#",
+"#.##########.##.##########.#",
+"#.##########.##.##########.#",
+"#..........................#",
+"############################"
+];
+
+const setCell = (r, c, ch) => { MAZE[r] = MAZE[r].slice(0, c) + ch + MAZE[r].slice(c + 1); };
+// vertical passage (col 14): 1-tile shaft through the top-centre pillar, opening in the bottom border
+setCell(0, 14, ' '); setCell(30, 14, ' ');
+setCell(1, 13, '.'); setCell(1, 14, '.');                       // top corridor now runs straight across
+for (let r = 2; r <= 4; r++) { setCell(r, 14, ' '); setCell(r, 15, '#'); }   // wall off the lane beside the shaft
+const PASS_COL = 14;
+
+const canvas = document.getElementById('game');
+canvas.width = W * SCALE; canvas.height = H * SCALE;
+const ctx = canvas.getContext('2d');
+
+/* ---- directions ---- */
+const UP = {x:0,y:-1,i:0}, LEFT = {x:-1,y:0,i:1}, DOWN = {x:0,y:1,i:2}, RIGHT = {x:1,y:0,i:3}, NONE = {x:0,y:0,i:-1};
+const DIRS = [UP, LEFT, DOWN, RIGHT];
+const OPP = [DOWN, RIGHT, UP, LEFT];
+const opp = d => d === NONE ? NONE : OPP[d.i];
+
+function walkable(c, r) {
+  if (r === TUNNEL_ROW && (c < 0 || c >= COLS)) return true;
+  if (c === PASS_COL && (r < 0 || r >= ROWS)) return true;       // vertical passage wrap
+  if (r < 0 || r >= ROWS || c < 0 || c >= COLS) return false;
+  const ch = MAZE[r][c];
+  return ch !== '#' && ch !== '-';
+}
+const canMove = (c, r, d) => walkable(c + d.x, r + d.y);
+
+/* BFS distance map to the tile just above the ghost-house door (used by "eyes") */
+const DIST = (() => {
+  const d = MAZE.map(row => Array.from(row, () => 1e9));
+  const q = [[13, 11], [14, 11]];
+  q.forEach(([c, r]) => d[r][c] = 0);
+  for (let h = 0; h < q.length; h++) {
+    const [c, r] = q[h];
+    for (const dir of DIRS) {
+      const nc = c + dir.x, nr = r + dir.y;
+      if (nc < 0 || nc >= COLS || nr < 0 || nr >= ROWS) continue;
+      if (!walkable(nc, nr) || d[nr][nc] < 1e9) continue;
+      d[nr][nc] = d[r][c] + 1; q.push([nc, nr]);
+    }
+  }
+  return d;
+})();
+function distTo(c, r) {
+  if (r < 0 || r >= ROWS) return 1e9;
+  c = Math.max(0, Math.min(COLS - 1, c));
+  return DIST[r][c];
+}
+
+/* =====================================================================
+   LANES  (normal / wide, random)
+   ===================================================================== */
+const reach = MAZE.map(row => Array.from(row, () => false));
+const laneOf = MAZE.map(row => Array.from(row, () => -1));
+const tileWide = MAZE.map(row => Array.from(row, () => true));
+const lanes = [];
+(() => {
+  const q = [[14, 23]]; reach[23][14] = true;
+  for (let h = 0; h < q.length; h++) {
+    const [c, r] = q[h];
+    for (const d of DIRS) {
+      const nc = c + d.x, nr = r + d.y;
+      if (nc < 0 || nc >= COLS || nr < 0 || nr >= ROWS || reach[nr][nc] || !walkable(nc, nr)) continue;
+      reach[nr][nc] = true; q.push([nc, nr]);
+    }
+  }
+})();
+const inReach = (c, r) => c >= 0 && c < COLS && r >= 0 && r < ROWS && reach[r][c];
+const isJunction = (c, r) => reach[r][c] && DIRS.filter(d => inReach(c + d.x, r + d.y)).length >= 3;
+(() => {   // a lane = chain of tiles between junctions
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+    if (!reach[r][c] || isJunction(c, r) || laneOf[r][c] >= 0) continue;
+    const id = lanes.length, q = [[c, r]]; laneOf[r][c] = id;
+    for (let h = 0; h < q.length; h++) {
+      const [qc, qr] = q[h];
+      for (const d of DIRS) {
+        const nc = qc + d.x, nr = qr + d.y;
+        if (!inReach(nc, nr) || isJunction(nc, nr) || laneOf[nr][nc] >= 0) continue;
+        laneOf[nr][nc] = id; q.push([nc, nr]);
+      }
+    }
+    lanes.push(q);
+  }
+})();
+let laneCanvas = null;
+function randomizeLanes() {
+  let flag = [];
+  for (let tries = 0; tries < 40; tries++) {
+    flag = lanes.map(() => Math.random() < 0.5);
+    const n = flag.filter(Boolean).length;
+    if (n >= lanes.length * 0.35 && n <= lanes.length * 0.65) break;
+  }
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+    if (!reach[r][c]) { tileWide[r][c] = true; continue; }
+    if (laneOf[r][c] >= 0) { tileWide[r][c] = flag[laneOf[r][c]]; continue; }
+    let has = false, any = false;                       // junction: wide if any neighbouring lane is wide
+    for (const d of DIRS) { const nc = c + d.x, nr = r + d.y; if (inReach(nc, nr) && laneOf[nr][nc] >= 0) { has = true; if (flag[laneOf[nr][nc]]) any = true; } }
+    tileWide[r][c] = !has || any;
+  }
+  buildLaneOverlay();
+}
+function laneOK(c, r) {
+  if (r < 0 || r >= ROWS) return true;
+  c = Math.max(0, Math.min(COLS - 1, c));
+  return tileWide[r][c];
+}
+function buildLaneOverlay() {
+  if (!laneCanvas) { laneCanvas = document.createElement('canvas'); laneCanvas.width = W * SCALE; laneCanvas.height = ROWS * T * SCALE; }
+  const g = laneCanvas.getContext('2d');
+  g.setTransform(SCALE, 0, 0, SCALE, 0, 0); g.clearRect(0, 0, W, ROWS * T);
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+    if (!reach[r][c]) continue;
+    const x = c * T, y = r * T;
+    const wide = tileWide[r][c], mx = x + T / 2, my = y + T / 2;
+    g.save(); g.strokeStyle = 'rgba(170,170,170,0.75)'; g.lineWidth = 1; g.setLineDash([3, 3]);
+    for (const d of DIRS) {                              // dashed guide line(s) toward each open neighbour
+      if (!walkable(c + d.x, r + d.y)) continue;
+      const offs = wide ? [-3.6, 3.6] : [0];
+      for (const o of offs) {
+        const ox = d.y !== 0 ? o : 0, oy = d.x !== 0 ? o : 0;
+        const back = wide ? 3.6 : 0;
+        g.beginPath(); g.moveTo(mx + ox - d.x * back, my + oy - d.y * back); g.lineTo(mx + ox + d.x * T / 2, my + oy + d.y * T / 2); g.stroke();
+      }
+    }
+    g.restore();
+    if (wide) continue;
+    // narrow tile: add inner bumpers along every wall side
+    g.fillStyle = '#4a5bff';
+    const cx = x + T / 2, cy = y + T / 2, a = 12.8, b = 6.8;
+    if (!walkable(c, r - 1)) g.fillRect(x, cy - a, T, a - b);
+    if (!walkable(c, r + 1)) g.fillRect(x, cy + b, T, a - b);
+    if (!walkable(c - 1, r)) g.fillRect(cx - a, y, a - b, T);
+    if (!walkable(c + 1, r)) g.fillRect(cx + b, y, a - b, T);
+  }
+}
+
+/* =====================================================================
+   PRE-RENDERED WALLS
+   ===================================================================== */
+function buildWalls(color) {
+  const c = document.createElement('canvas');
+  c.width = W * SCALE; c.height = ROWS * T * SCALE;
+  const g = c.getContext('2d');
+  g.scale(SCALE, SCALE);
+  const wall = (cc, rr) => rr >= 0 && rr < ROWS && cc >= 0 && cc < COLS && MAZE[rr][cc] === '#';
+  const w1 = T * 0.4, w2 = w1 - 3;
+  for (const pass of [0, 1]) {
+    const lw = pass ? w2 : w1;
+    g.strokeStyle = g.fillStyle = pass ? '#000' : color;
+    g.lineWidth = lw; g.lineCap = 'round';
+    if (!pass) { g.shadowColor = color; g.shadowBlur = 7; } else { g.shadowBlur = 0; }
+    g.beginPath();
+    for (let r = 0; r < ROWS; r++) for (let cc = 0; cc < COLS; cc++) {
+      if (!wall(cc, r)) continue;
+      const x = (cc + 0.5) * T, y = (r + 0.5) * T;
+      g.moveTo(x + lw / 2, y); g.arc(x, y, lw / 2, 0, Math.PI * 2);
+      if (wall(cc + 1, r)) { g.moveTo(x, y); g.lineTo(x + T, y); }
+      if (wall(cc, r + 1)) { g.moveTo(x, y); g.lineTo(x, y + T); }
+      if (wall(cc + 1, r) && wall(cc, r + 1) && wall(cc + 1, r + 1)) g.rect(x, y, T, T);   // fill interior of thick blocks
+    }
+    g.fill(); g.stroke();
+  }
+  // ghost-house door
+  g.shadowBlur = 0; g.strokeStyle = '#ffb8de'; g.lineWidth = 3; g.lineCap = 'butt';
+  g.beginPath(); g.moveTo(13 * T, 12.5 * T); g.lineTo(15 * T, 12.5 * T); g.stroke();
+  return c;
+}
+const wallsBlue = buildWalls('#2535ff');
+
+/* =====================================================================
+   AUDIO  (all synthesized with Web Audio – no files)
+   ===================================================================== */
+const Sound = (() => {
+  let ac = null, master, sfxBus, musicBus, drumBus, bassF, leadF, delayIn, noiseBuf;
+  let muted = false, musicOn = false, timer = null, step = 0, nextT = 0, wakaFlip = false;
+  const loops = {};
+  const BPM = 126, SD = 60 / BPM / 4;
+  const ROOT = [45, 41, 48, 43];                         // Am  F  C  G
+  const CH = [[57,60,64],[53,57,60],[55,60,64],[55,59,62]];
+  const BASS = [0,0,12,0,0,12,0,12];
+  const ARP = [0,1,2,3,2,1,2,3,0,1,2,3,2,1,2,1];
+  const LEAD = [
+    [76,0,0,76, 0,74,72,0, 74,0,0,0, 72,0,69,0],
+    [72,0,0,72, 0,69,72,0, 77,0,0,0, 74,0,72,0],
+    [76,0,0,76, 0,79,76,0, 74,0,72,0, 67,0,72,0],
+    [74,0,0,74, 0,71,74,0, 79,0,0,0, 74,0,71,0]
+  ];
+  const mtof = n => 440 * Math.pow(2, (n - 69) / 12);
+
+  function init() {
+    if (ac) { if (ac.state === 'suspended') ac.resume(); return; }
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    ac = new AC();
+    const comp = ac.createDynamicsCompressor();
+    master = ac.createGain(); master.gain.value = muted ? 0 : 0.8;
+    master.connect(comp); comp.connect(ac.destination);
+    sfxBus = ac.createGain(); sfxBus.gain.value = 0.9; sfxBus.connect(master);
+    musicBus = ac.createGain(); musicBus.gain.value = 0.5; musicBus.connect(master);
+    drumBus = ac.createGain(); drumBus.gain.value = 1; drumBus.connect(musicBus);
+    bassF = ac.createBiquadFilter(); bassF.type = 'lowpass'; bassF.frequency.value = 650; bassF.connect(musicBus);
+    leadF = ac.createBiquadFilter(); leadF.type = 'lowpass'; leadF.frequency.value = 3200; leadF.connect(musicBus);
+    delayIn = ac.createGain(); delayIn.gain.value = 1; delayIn.connect(leadF);
+    const dl = ac.createDelay(1); dl.delayTime.value = SD * 3;
+    const fb = ac.createGain(); fb.gain.value = 0.32;
+    const wet = ac.createGain(); wet.gain.value = 0.35;
+    delayIn.connect(dl); dl.connect(fb); fb.connect(dl); dl.connect(wet); wet.connect(leadF);
+    noiseBuf = ac.createBuffer(1, ac.sampleRate, ac.sampleRate);
+    const d = noiseBuf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  }
+
+  /* ---- primitives ---- */
+  function tone(o) {
+    if (!ac) return;
+    const t = ac.currentTime + (o.at || 0), dur = Math.max(0.04, o.dur || 0.1), vol = o.vol == null ? 0.15 : o.vol;
+    const osc = ac.createOscillator(), g = ac.createGain();
+    osc.type = o.type || 'square';
+    osc.frequency.setValueAtTime(o.f, t);
+    if (o.f2) osc.frequency.exponentialRampToValueAtTime(Math.max(1, o.f2), t + dur);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(vol, t + 0.006);
+    g.gain.setValueAtTime(vol, t + Math.max(0.007, dur - 0.03));
+    g.gain.linearRampToValueAtTime(0.0001, t + dur);
+    osc.connect(g); g.connect(o.bus || sfxBus);
+    osc.start(t); osc.stop(t + dur + 0.02);
+  }
+  function noise(t, dur, vol, hp, dest) {
+    const s = ac.createBufferSource(), f = ac.createBiquadFilter(), g = ac.createGain();
+    s.buffer = noiseBuf; f.type = 'highpass'; f.frequency.value = hp;
+    g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    s.connect(f); f.connect(g); g.connect(dest);
+    s.start(t, Math.random() * 0.5); s.stop(t + dur + 0.02);
+  }
+  function voice(type, f, t, dur, vol, dest, detune, pluck) {
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.type = type; o.frequency.value = f; if (detune) o.detune.value = detune;
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(vol, t + 0.01);
+    if (pluck) g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    else { g.gain.setValueAtTime(vol, t + Math.max(0.011, dur - 0.05)); g.gain.linearRampToValueAtTime(0.0001, t + dur); }
+    o.connect(g); g.connect(dest); o.start(t); o.stop(t + dur + 0.02);
+  }
+
+  /* ---- music ---- */
+  function playStep(s, t) {
+    const bar = (s >> 4) & 3, i = s & 15;
+    if (i % 4 === 0) {                                   // kick
+      const o = ac.createOscillator(), g = ac.createGain();
+      o.frequency.setValueAtTime(170, t); o.frequency.exponentialRampToValueAtTime(42, t + 0.12);
+      g.gain.setValueAtTime(0.55, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
+      o.connect(g); g.connect(drumBus); o.start(t); o.stop(t + 0.22);
+    }
+    if (i === 4 || i === 12) {                           // snare
+      noise(t, 0.14, 0.2, 1400, drumBus);
+      voice('triangle', 190, t, 0.09, 0.12, drumBus, 0, true);
+    }
+    if (i % 2 === 0) noise(t, i % 4 === 2 ? 0.09 : 0.03, i % 4 === 2 ? 0.06 : 0.05, 7000, drumBus);   // hats
+    if (i % 2 === 0) {                                   // bass
+      const n = ROOT[bar] + BASS[i >> 1];
+      voice('sawtooth', mtof(n), t, SD * 1.9, 0.17, bassF, 0, false);
+    }
+    const c = CH[bar], arr = [c[0], c[1], c[2], c[0] + 12];   // arpeggio
+    voice('square', mtof(arr[ARP[i]]), t, SD * 1.4, 0.035, delayIn, 0, true);
+    const m = LEAD[bar][i];                              // lead
+    if (m) {
+      let len = 1; while (i + len < 16 && !LEAD[bar][i + len] && len < 4) len++;
+      const d = SD * len * 0.95;
+      voice('sawtooth', mtof(m), t, d, 0.05, delayIn, -8, false);
+      voice('square', mtof(m), t, d, 0.04, delayIn, 8, false);
+    }
+  }
+  function sched() {
+    if (!ac || !musicOn) return;
+    if (nextT < ac.currentTime - 0.1) nextT = ac.currentTime + 0.02;
+    while (nextT < ac.currentTime + 0.15) { playStep(step, nextT); nextT += SD; step = (step + 1) & 63; }
+  }
+  function startMusic() {
+    if (!ac || musicOn) return;
+    musicOn = true; step = 0; nextT = ac.currentTime + 0.05;
+    timer = setInterval(sched, 25);
+  }
+  function stopMusic() { musicOn = false; clearInterval(timer); timer = null; }
+  function duck(on) { if (ac) musicBus.gain.setTargetAtTime(on ? 0.12 : 0.5, ac.currentTime, 0.05); }
+
+  /* ---- loops (sirens) ---- */
+  function loop(key, on, type, base, depth, rate, vol) {
+    if (!ac) return;
+    if (on && !loops[key]) {
+      const o = ac.createOscillator(), g = ac.createGain(), l = ac.createOscillator(), lg = ac.createGain();
+      o.type = type; o.frequency.value = base; l.type = 'triangle'; l.frequency.value = rate; lg.gain.value = depth;
+      l.connect(lg); lg.connect(o.frequency);
+      g.gain.value = 0; g.gain.setTargetAtTime(vol, ac.currentTime, 0.03);
+      o.connect(g); g.connect(sfxBus); o.start(); l.start();
+      loops[key] = { o, g, l };
+    } else if (!on && loops[key]) {
+      const L = loops[key]; delete loops[key];
+      L.g.gain.setTargetAtTime(0, ac.currentTime, 0.03);
+      const t = ac.currentTime + 0.25; L.o.stop(t); L.l.stop(t);
+    }
+  }
+  const fright = on => loop('fright', on, 'square', 330, 110, 6.5, 0.07);
+  const eyes = on => loop('eyes', on, 'sine', 1050, 380, 13, 0.07);
+
+  /* ---- effects ---- */
+  function waka() {
+    if (!ac) return; wakaFlip = !wakaFlip;
+    tone({ f: wakaFlip ? 520 : 200, f2: wakaFlip ? 200 : 520, dur: 0.075, type: 'square', vol: 0.09 });
+  }
+  function eatGhost() {
+    tone({ f: 180, f2: 1500, dur: 0.28, type: 'square', vol: 0.14 });
+    tone({ f: 360, f2: 2200, dur: 0.28, type: 'triangle', vol: 0.1, at: 0.02 });
+  }
+  function fruit() {
+    tone({ f: 700, dur: 0.08, vol: 0.12 }); tone({ f: 1050, dur: 0.08, vol: 0.12, at: 0.08 }); tone({ f: 1400, dur: 0.14, vol: 0.12, at: 0.16 });
+  }
+  function death() {
+    if (!ac) return;
+    const sweeps = [[900, 280], [760, 230], [620, 180], [480, 110]];
+    sweeps.forEach((s, i) => tone({ f: s[0], f2: s[1], dur: 0.3, type: 'square', vol: 0.15, at: i * 0.3 }));
+    sweeps.forEach((s, i) => tone({ f: s[0] / 2, f2: s[1] / 2, dur: 0.3, type: 'sawtooth', vol: 0.07, at: i * 0.3 }));
+    for (let i = 0; i < 3; i++) tone({ f: 1200 - i * 150, f2: 300, dur: 0.1, type: 'square', vol: 0.12, at: 1.3 + i * 0.12 });
+  }
+  function arp(notes, step, type, vol, dur) {
+    notes.forEach((n, i) => tone({ f: mtof(n), dur: dur || step * 1.5, type: type || 'square', vol: vol || 0.1, at: i * step }));
+  }
+  function intro() { arp([57,64,69,72, 59,66,71,74, 60,67,72,76, 64,71,76,79, 69,72,76,81], 0.1, 'square', 0.09, 0.14); }
+  function levelClear() { arp([69,72,76,81, 76,81,84,88], 0.11, 'square', 0.1, 0.16); }
+  function extraLife() { arp([76,79,84,88,91], 0.07, 'triangle', 0.14, 0.12); }
+  function gameOver() { arp([69,66,62,57,50], 0.22, 'sawtooth', 0.1, 0.3); }
+
+  function poison() {
+    for (let i = 0; i < 5; i++) tone({ f: 700 - i * 90, f2: 160, dur: 0.14, type: 'sawtooth', vol: 0.12, at: i * 0.08 });
+    tone({ f: 90, f2: 50, dur: 0.5, type: 'square', vol: 0.12 });
+  }
+  function poisonAlert() { tone({ f: 300, f2: 120, dur: 0.18, type: 'sawtooth', vol: 0.09 }); tone({ f: 300, f2: 120, dur: 0.18, type: 'sawtooth', vol: 0.09, at: 0.2 }); }
+  function lane() { arp([60, 55, 60, 55], 0.09, 'square', 0.08, 0.1); }
+  function bolt() { tone({ f: 500, f2: 1900, dur: 0.12, type: 'square', vol: 0.12 }); tone({ f: 1000, f2: 2600, dur: 0.12, type: 'square', vol: 0.1, at: 0.1 }); }
+  function teleport() { tone({ f: 200, f2: 2000, dur: 0.16, type: 'sawtooth', vol: 0.13 }); tone({ f: 2000, f2: 260, dur: 0.2, type: 'square', vol: 0.1, at: 0.16 }); }
+  function snail() { tone({ f: 700, f2: 120, dur: 0.45, type: 'triangle', vol: 0.16 }); tone({ f: 350, f2: 60, dur: 0.45, type: 'square', vol: 0.07, at: 0.05 }); }
+  function freeze() { [96, 103, 108, 112, 115].forEach((n, i) => tone({ f: mtof(n), dur: 0.2, type: 'sine', vol: 0.11, at: i * 0.05 })); tone({ f: 1800, f2: 400, dur: 0.4, type: 'triangle', vol: 0.06 }); }
+  function toggleMute() { muted = !muted; if (ac) master.gain.setTargetAtTime(muted ? 0 : 0.8, ac.currentTime, 0.02); return muted; }
+  function suspend() { if (ac && ac.state === 'running') ac.suspend(); }
+  function resume() { if (ac && ac.state === 'suspended') ac.resume(); }
+  return { init, startMusic, stopMusic, duck, fright, eyes, waka, eatGhost, fruit, death, intro, levelClear, extraLife, gameOver, poison, poisonAlert, lane, bolt, teleport, snail, freeze,
+           toggleMute, suspend, resume, get muted() { return muted; } };
+})();
+
+/* =====================================================================
+   GAME STATE
+   ===================================================================== */
+const FRIGHT = [6,5,4,3,2,5,2,2,1,5,2,1,1,3,1,1,0,1];
+const FRUIT_KIND = [0,1,2,2,3,3,4,4,5,5,6,6,7];
+const FRUIT_PTS  = [100,300,500,500,700,700,1000,1000,2000,2000,3000,3000,5000];
+/* ---- V2 tuning ---- */
+const REGEN_TIME = 10;        // seconds until an eaten dot grows back (oldest first)
+const LANE_EVERY = 60;        // lanes re-randomize every N seconds of play
+const POISON_FIRST = 20;      // first poison dot appears after this many seconds of play
+const POISON_EVERY = 60;      // then once every minute
+const POISON_LIFE = 10;       // poison dot lifetime (s)
+const WIDE_TIME = 30, WIDE_FLASH = 5;
+const LEVEL_EVERY = 120;      // level (speed) increases every N seconds of play
+const HEART_FIRST = 20, HEART_EVERY = 120;   // heart dot (+1 life): every 2 minutes
+const SNAIL_FIRST = 20, SNAIL_EVERY = 60;    // snail dot (slow ghosts): every minute
+const SPECIAL_LIFE = 10, SLOW_TIME = 10;
+const SNOW_FIRST = 20, SNOW_EVERY = 60, ICE_TIME = 5, ICE_FLASH = 2;   // snowflake dot: freezes ghosts
+const PAC_R_NORMAL = T * 0.42, PAC_R_WIDE = T * 0.78;
+
+let state = 'title', stateTime = 0, paused = false, globalTime = 0;
+let score = 0, hi = 0, level = 1, lives = 3, extraGiven = false, firstReady = true, hiDirty = false;
+const makeDots = () => MAZE.map(row => Array.from(row, ch => ch === '.' ? 1 : ch === 'o' ? 2 : 0));
+const makeBorn = () => MAZE.map(row => Array.from(row, () => -99));
+let dots = makeDots(), born = makeBorn(), remaining = 0, eaten = 0;
+let tele = 0, bolt = null, nextBolt = 20; const fx = [];
+let heart = null, nextHeart = HEART_FIRST, snail = null, nextSnail = SNAIL_FIRST, slowTimer = 0;
+let snow = null, nextSnow = SNOW_FIRST, iceTimer = 0;
+let playTime = 0, regenQ = [], poison = null, nextPoison = POISON_FIRST, laneTimer = LANE_EVERY, levelTimer = LEVEL_EVERY, wideTimer = 0;
+let frightTimer = 0, freeze = 0, combo = 0, modeIndex = 0, modeTimer = 0, schedule = [], lp;
+let sinceRelease = 0, noDotTimer = 0, relCool = 0, diedThisLevel = false, readyDur = 2;
+let fruit = null;
+const popups = [];
+
+try { hi = parseInt(localStorage.getItem('pacman_highscore') || '0', 10) || 0; } catch (e) { hi = 0; }
+function saveHi() { if (!hiDirty) return; hiDirty = false; try { localStorage.setItem('pacman_highscore', String(hi)); } catch (e) {} }
+function addScore(n) {
+  score += n;
+  if (score > hi) { hi = score; hiDirty = true; }
+  if (!extraGiven && score >= 10000) { extraGiven = true; lives++; Sound.extraLife(); }
+}
+
+/* ---- actors ---- */
+const pac = { x: 13.5, y: 23, dir: NONE, face: LEFT, anim: 0, r: PAC_R_NORMAL };
+const ghosts = [
+  { name: 'blinky', color: '#ff0000', scatter: { x: 25, y: -3 }, home: { x: 13.5, y: 11 } },
+  { name: 'pinky',  color: '#ffb8ff', scatter: { x: 2,  y: -3 }, home: { x: 13.5, y: 14 } },
+  { name: 'inky',   color: '#00ffff', scatter: { x: 27, y: 31 }, home: { x: 11.5, y: 14 } },
+  { name: 'clyde',  color: '#ffb851', scatter: { x: 0,  y: 31 }, home: { x: 15.5, y: 14 } }
+];
+
+function levelParams(L) {
+  if (L === 1) return { pac: .80, gh: .75, tun: .40, fpac: .90, fgh: .50 };
+  if (L <= 4)  return { pac: .90, gh: .85, tun: .45, fpac: .95, fgh: .55 };
+  if (L <= 20) return { pac: 1.0, gh: .95, tun: .50, fpac: 1.0, fgh: .60 };
+  return { pac: .90, gh: .95, tun: .50, fpac: .90, fgh: .60 };
+}
+function getSchedule(L) {
+  if (L === 1) return [7,20,7,20,5,20,5,Infinity];
+  if (L <= 4)  return [7,20,7,20,5,1033,1/60,Infinity];
+  return [5,20,5,20,5,1037,1/60,Infinity];
+}
+
+function newGame() {
+  score = 0; level = 1; lives = 3; extraGiven = false; firstReady = true;
+  tele = 0; nextBolt = 20; nextHeart = HEART_FIRST; nextSnail = SNAIL_FIRST; nextSnow = SNOW_FIRST; playTime = 0; nextPoison = POISON_FIRST; laneTimer = LANE_EVERY; levelTimer = LEVEL_EVERY;
+  randomizeLanes();
+  buildLevel();
+  startReady();
+}
+function buildLevel() {
+  dots = makeDots(); born = makeBorn(); regenQ = []; poison = null; bolt = null; heart = null; snail = null; snow = null;
+  remaining = 0; dots.forEach(r => r.forEach(v => { if (v) remaining++; }));
+  eaten = 0; fruit = null; diedThisLevel = false;
+  lp = levelParams(level); schedule = getSchedule(level);
+  resetActors();
+}
+function resetActors() {
+  pac.x = 13.5; pac.y = 23; pac.dir = NONE; pac.face = LEFT; pac.anim = 0; pac.r = PAC_R_NORMAL; wideTimer = 0; slowTimer = 0; iceTimer = 0;
+  ghosts.forEach((g, i) => {
+    g.x = g.home.x; g.y = g.home.y; g.frightened = false; g.pendingReverse = false; g.path = [];
+    g.phase = i * 1.7; g.eatenFreeze = false; g.look = i === 0 ? LEFT : UP;
+    if (i === 0) { g.state = 'normal'; g.dir = LEFT; } else { g.state = 'house'; g.dir = NONE; }
+  });
+  frightTimer = 0; freeze = 0; combo = 0; modeIndex = 0; modeTimer = schedule[0];
+  sinceRelease = 0; noDotTimer = 0; relCool = 0; fruit = null; popups.length = 0;
+  held.length = 0; buffered = null;
+}
+function startReady() {
+  state = 'ready'; stateTime = 0;
+  readyDur = firstReady ? 3.2 : 2.0;
+  if (firstReady) Sound.intro();
+}
+
+/* =====================================================================
+   INPUT
+   ===================================================================== */
+const held = []; let buffered = null, bufferTime = -9;
+function pressDir(d) {
+  const k = held.indexOf(d); if (k >= 0) held.splice(k, 1);
+  held.push(d); buffered = d; bufferTime = globalTime;
+}
+function releaseDir(d) { const k = held.indexOf(d); if (k >= 0) held.splice(k, 1); }
+function desiredDir() {
+  if (held.length) return held[held.length - 1];
+  if (buffered && globalTime - bufferTime < 0.6) return buffered;
+  return null;
+}
+const KEYS = { ArrowUp: UP, ArrowDown: DOWN, ArrowLeft: LEFT, ArrowRight: RIGHT, KeyW: UP, KeyS: DOWN, KeyA: LEFT, KeyD: RIGHT };
+
+function activate() {
+  Sound.init();
+  if (state === 'title' || (state === 'gameover' && stateTime > 2.5)) { saveHi(); newGame(); }
+}
+function togglePause() {
+  if (state === 'title' || state === 'gameover') return;
+  paused = !paused;
+  if (paused) { Sound.suspend(); saveHi(); } else Sound.resume();
+}
+window.addEventListener('keydown', e => {
+  const d = KEYS[e.code];
+  if (d || e.code === 'Space' || e.code === 'Enter') e.preventDefault();
+  if (d) { if (!e.repeat) { Sound.init(); pressDir(d); } return; }
+  if (e.repeat) return;
+  if (e.code === 'Space' && state === 'playing' && !paused) teleportPac();
+  else if (e.code === 'Enter' || e.code === 'Space') { if (paused) togglePause(); else activate(); }
+  else if (e.code === 'KeyP' || e.code === 'Escape') togglePause();
+  else if (e.code === 'KeyM') { Sound.init(); Sound.toggleMute(); }
+});
+window.addEventListener('keyup', e => { const d = KEYS[e.code]; if (d) releaseDir(d); });
+window.addEventListener('blur', () => { held.length = 0; if (state === 'playing' && !paused) togglePause(); });
+document.addEventListener('visibilitychange', () => { if (document.hidden && !paused && state !== 'title' && state !== 'gameover') togglePause(); });
+window.addEventListener('beforeunload', saveHi);
+
+let touch = null;
+canvas.addEventListener('pointerdown', e => {
+  touch = { x: e.clientX, y: e.clientY, done: false };
+  if (paused) togglePause(); else activate();
+});
+canvas.addEventListener('pointermove', e => {
+  if (!touch || touch.done || e.pointerType === 'mouse') return;
+  const dx = e.clientX - touch.x, dy = e.clientY - touch.y;
+  if (Math.hypot(dx, dy) < 18) return;
+  pressDir(Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? RIGHT : LEFT) : (dy > 0 ? DOWN : UP));
+  touch.x = e.clientX; touch.y = e.clientY;
+});
+window.addEventListener('pointerup', () => { touch = null; });
+
+/* =====================================================================
+   MOVEMENT CORE
+   ===================================================================== */
+const isCentered = e => Math.abs(e.x - Math.round(e.x)) < 1e-6 && Math.abs(e.y - Math.round(e.y)) < 1e-6;
+
+function moveEntity(e, dist, decide) {
+  let guard = 0;
+  while (dist > 1e-9 && guard++ < 12) {
+    if (isCentered(e)) decide(e);
+    if (e.dir === NONE || e.state === 'entering') return;
+    const horiz = e.dir.x !== 0, s = horiz ? e.dir.x : e.dir.y, p = horiz ? e.x : e.y;
+    const target = s > 0 ? Math.floor(p + 1e-7) + 1 : Math.ceil(p - 1e-7) - 1;
+    const toT = Math.abs(target - p);
+    if (dist >= toT - 1e-9) {
+      if (horiz) {
+        e.x = target;
+        if (e.dir.x < 0 && e.x <= -2) e.x += 32; else if (e.dir.x > 0 && e.x >= 30) e.x -= 32;
+      } else {
+        e.y = target;
+        if (e.dir.y < 0 && e.y <= -2) e.y += ROWS + 4; else if (e.dir.y > 0 && e.y >= ROWS + 2) e.y -= ROWS + 4;
+      }
+      dist -= toT;
+    } else {
+      if (horiz) e.x += s * dist; else e.y += s * dist;
+      dist = 0;
+    }
+  }
+}
+
+/* ---------------- Pac-Man ---------------- */
+function pacSpeed() { return BASE_SPEED * (frightTimer > 0 ? lp.fpac : lp.pac); }
+
+function pacCanMove(c, r, d) {
+  if (!canMove(c, r, d)) return false;
+  if (wideTimer <= 0) return true;                       // normal Pac fits everywhere
+  if (laneOK(c + d.x, r + d.y)) return true;             // wide Pac only enters wide lanes...
+  return !laneOK(c, r);                                  // ...unless already squeezed inside a narrow one
+}
+const hitR = () => 0.5 + (pac.r - PAC_R_NORMAL) / T * 0.9;
+
+function decidePac(e) {
+  const c = Math.round(e.x), r = Math.round(e.y), want = desiredDir();
+  if (want && pacCanMove(c, r, want)) { e.dir = want; e.face = want; if (buffered === want && held.indexOf(want) < 0) buffered = null; }
+  else if (e.dir !== NONE && pacCanMove(c, r, e.dir)) { /* keep going */ }
+  else e.dir = NONE;
+}
+
+function updatePac(dt) {
+  const want = desiredDir();
+  if (want && pac.dir !== NONE) {
+    if (want === opp(pac.dir)) { pac.dir = want; pac.face = want; }             // instant reverse
+    else if (want !== pac.dir && !isCentered(pac)) {                             // forgiving corner assist
+      const axisX = pac.dir.x !== 0, p = axisX ? pac.x : pac.y, n = Math.round(p);
+      if (Math.abs(p - n) <= 0.25) {
+        const c = axisX ? n : Math.round(pac.x), r = axisX ? Math.round(pac.y) : n;
+        if (Number.isInteger(axisX ? pac.y : pac.x) && pacCanMove(c, r, want)) { if (axisX) pac.x = n; else pac.y = n; }
+      }
+    }
+  } else if (want && pac.dir === NONE && !isCentered(pac) && want.y === 0) { pac.dir = want; pac.face = want; }
+
+  const before = pac.x + pac.y;
+  const sp = pacSpeed() * dt;
+  moveEntity(pac, sp, decidePac);
+  if (pac.dir !== NONE) pac.anim += sp * 0.7;
+  void before;
+
+  // eat
+  const c = Math.round(pac.x), r = Math.round(pac.y);
+  if (c >= 0 && c < COLS && r >= 0 && r < ROWS && dots[r][c] && Math.abs(pac.x - c) < 0.45 && Math.abs(pac.y - r) < 0.45) {
+    const v = dots[r][c]; dots[r][c] = 0; remaining--; eaten++; sinceRelease++; noDotTimer = 0;
+    regenQ.push({ c, r, v: v === 2 ? 2 : 1, t: playTime });
+    if (v === 1) { addScore(10); Sound.waka(); }
+    else if (v === 2) { addScore(50); Sound.waka(); startFright(); }
+    else if (v === 4) { bolt = null; tele = Math.min(9, tele + 1); addScore(50); Sound.bolt(); popup(c, r, '+1 TELEPORT', '#ffff00'); }
+    else if (v === 5) { heart = null; lives = Math.min(9, lives + 1); addScore(100); Sound.extraLife(); popup(c, r, '+1 LIFE', '#ff4d6d'); }
+    else if (v === 7) { snow = null; iceTimer = ICE_TIME; addScore(100); Sound.freeze(); popup(c, r, 'GHOSTS FROZEN', '#bfefff'); }
+    else if (v === 6) { snail = null; slowTimer = SLOW_TIME; addScore(100); Sound.snail(); popup(c, r, 'GHOSTS SLOWED', '#b8e08a'); }
+    else { addScore(100); poison = null; wideTimer = WIDE_TIME; Sound.poison(); popup(c, r, 'FAT PAC!', '#39ff14'); }
+    if (eaten % 100 === 0 && !fruit) spawnFruit();
+    if (remaining === 0) { addScore(1000); popup(13.5, 17, 'CLEARED +1000', '#ffe600'); }
+  }
+}
+
+/* ---------------- Ghosts ---------------- */
+const RED_ZONE = (c, r) => (r === 11 || r === 23) && (c === 12 || c === 15);
+
+function elroyLevel() {
+  const t1 = 20 + Math.min(level - 1, 10) * 8;
+  return remaining <= t1 / 2 ? 2 : remaining <= t1 ? 1 : 0;
+}
+function ghostSpeedBase(g) {
+  if (g.state === 'eyes' || g.state === 'entering') return BASE_SPEED * 1.7;
+  if (g.state === 'house' || g.state === 'leaving') return BASE_SPEED * 0.4;
+  if (Math.round(g.y) === TUNNEL_ROW && (g.x < 5.5 || g.x > 21.5)) return BASE_SPEED * lp.tun;
+  if (g.frightened) return BASE_SPEED * lp.fgh;
+  let s = lp.gh;
+  if (g.name === 'blinky') s += 0.05 * elroyLevel();
+  return BASE_SPEED * s;
+}
+function ghostSpeed(g) {
+  const s = ghostSpeedBase(g);
+  return slowTimer > 0 && g.state !== 'eyes' && g.state !== 'entering' ? s * 0.5 : s;
+}
+const scatterMode = () => modeIndex % 2 === 0;
+
+function ghostTarget(g) {
+  const px = Math.round(pac.x), py = Math.round(pac.y), f = pac.face;
+  if (scatterMode() && !(g.name === 'blinky' && elroyLevel() > 0)) return g.scatter;
+  switch (g.name) {
+    case 'blinky': return { x: px, y: py };
+    case 'pinky': { let tx = px + 4 * f.x, ty = py + 4 * f.y; if (f === UP) tx -= 4; return { x: tx, y: ty }; }
+    case 'inky': {
+      let ax = px + 2 * f.x, ay = py + 2 * f.y; if (f === UP) ax -= 2;
+      const b = ghosts[0]; return { x: 2 * ax - Math.round(b.x), y: 2 * ay - Math.round(b.y) };
+    }
+    default: {
+      const d2 = (Math.round(g.x) - px) ** 2 + (Math.round(g.y) - py) ** 2;
+      return d2 > 64 ? { x: px, y: py } : g.scatter;
+    }
+  }
+}
+
+function decideGhost(g) {
+  const c = Math.round(g.x), r = Math.round(g.y);
+  if (g.state === 'eyes') {
+    if (distTo(c, r) === 0 && c >= 13 && c <= 14 && r === 11) {
+      g.state = 'entering'; g.dir = NONE; g.path = [{ x: 13.5, y: 11 }, { x: 13.5, y: 14 }]; return;
+    }
+    let best = null, bd = 1e9;
+    for (const d of DIRS) {
+      if (!walkable(c + d.x, r + d.y)) continue;
+      const dd = distTo(c + d.x, r + d.y);
+      if (dd < bd) { bd = dd; best = d; }
+    }
+    if (best) g.dir = best;
+    return;
+  }
+  if (g.pendingReverse) {
+    g.pendingReverse = false;
+    const b = opp(g.dir);
+    if (b !== NONE && canMove(c, r, b)) { g.dir = b; g.look = b; return; }
+  }
+  const back = opp(g.dir), opts = [];
+  for (const d of DIRS) {
+    if (d === back || !canMove(c, r, d)) continue;
+    if (d === UP && !g.frightened && RED_ZONE(c, r)) continue;
+    opts.push(d);
+  }
+  let pick;
+  if (opts.length === 0) pick = back;
+  else if (opts.length === 1) pick = opts[0];
+  else if (g.frightened) pick = opts[(Math.random() * opts.length) | 0];
+  else {
+    const t = ghostTarget(g); let bd = 1e18; pick = opts[0];
+    for (const d of opts) {
+      const dd = (c + d.x - t.x) ** 2 + (r + d.y - t.y) ** 2;
+      if (dd < bd - 1e-9) { bd = dd; pick = d; }
+    }
+  }
+  g.dir = pick; if (pick !== NONE) g.look = pick;
+}
+
+function followPath(g, dist) {
+  while (dist > 1e-9 && g.path.length) {
+    const w = g.path[0], dx = w.x - g.x, dy = w.y - g.y, d = Math.hypot(dx, dy);
+    if (d > 1e-9) g.look = Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? RIGHT : LEFT) : (dy > 0 ? DOWN : UP);
+    if (d <= dist) { g.x = w.x; g.y = w.y; dist -= d; g.path.shift(); }
+    else { g.x += dx / d * dist; g.y += dy / d * dist; dist = 0; }
+  }
+  return g.path.length === 0;
+}
+
+function updateGhost(g, dt) {
+  switch (g.state) {
+    case 'house':
+      g.y = 14 + 0.4 * Math.sin(globalTime * 7 + g.phase); g.look = UP; break;
+    case 'leaving':
+      if (followPath(g, ghostSpeed(g) * dt)) { g.state = 'normal'; g.x = 13.5; g.y = 11; g.dir = LEFT; g.look = LEFT; }
+      break;
+    case 'entering':
+      if (followPath(g, ghostSpeed(g) * dt)) {
+        g.frightened = false; g.state = 'leaving'; g.x = 13.5; g.y = 14; g.path = [{ x: 13.5, y: 11 }];
+      }
+      break;
+    default:
+      moveEntity(g, ghostSpeed(g) * dt, decideGhost);
+  }
+}
+
+function releaseLimit(i) {
+  if (diedThisLevel) return [0, 7, 10, 15][i];
+  if (level === 1) return [0, 0, 30, 60][i];
+  if (level === 2) return [0, 0, 0, 50][i];
+  return 0;
+}
+function releaseLogic(dt) {
+  noDotTimer += dt; relCool -= dt;
+  const i = ghosts.findIndex(g => g.state === 'house');
+  if (i < 0 || relCool > 0) return;
+  if (sinceRelease >= releaseLimit(i) || noDotTimer >= (level < 5 ? 4 : 3)) {
+    const g = ghosts[i];
+    g.state = 'leaving'; g.path = [{ x: 13.5, y: g.y }, { x: 13.5, y: 11 }];
+    sinceRelease = 0; noDotTimer = 0; relCool = 0.8;
+  }
+}
+
+/* ---------------- modes / fright ---------------- */
+function nextMode() {
+  modeIndex = Math.min(modeIndex + 1, schedule.length - 1);
+  modeTimer = schedule[modeIndex];
+  ghosts.forEach(g => { if (g.state === 'normal') g.pendingReverse = true; });
+}
+function startFright() {
+  combo = 0;
+  const dur = FRIGHT[level - 1] || 0;
+  ghosts.forEach(g => {
+    if (g.state === 'eyes' || g.state === 'entering') return;
+    if (dur > 0) g.frightened = true;
+    if (g.state === 'normal') g.pendingReverse = true;
+  });
+  if (dur > 0) { frightTimer = dur; Sound.duck(true); }
+}
+function endFright() {
+  frightTimer = 0; ghosts.forEach(g => g.frightened = false);
+  Sound.duck(false); Sound.fright(false);
+}
+
+/* ---------------- fruit ---------------- */
+function spawnFruit() { fruit = { x: 13.5, y: 17, t: 9.5 + Math.random() * 0.5 }; }
+const fruitIndex = () => Math.min(level - 1, 12);
+
+/* ---------------- collisions & events ---------------- */
+function popup(x, y, text, color) { popups.push({ x, y, text, color, t: 0 }); }
+
+function eatGhost(g) {
+  combo++;
+  const pts = 200 * Math.pow(2, combo - 1);
+  addScore(pts); Sound.eatGhost();
+  popup(g.x, g.y, String(pts), '#00ffff');
+  g.frightened = false; g.eatenFreeze = true; g.pendingReverse = false;
+  if (g.state === 'leaving') { g.state = 'entering'; g.dir = NONE; g.path = [{ x: 13.5, y: g.y }, { x: 13.5, y: 14 }]; }
+  else { g.state = 'eyes'; if (g.dir === NONE) g.dir = LEFT; }
+  freeze = 0.6;
+}
+function killPac() {
+  state = 'dying'; stateTime = 0; lives--; diedThisLevel = true;
+  Sound.stopMusic(); Sound.fright(false); Sound.eyes(false); Sound.duck(false);
+  saveHi();
+}
+function levelUp() { level++; lp = levelParams(level); popup(13.5, 11, 'LEVEL ' + level, '#ffe600'); Sound.levelClear(); }
+function spawnSpecial(v) {
+  const list = [];
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) if (dots[r][c] === 1) list.push([c, r]);
+  if (!list.length) return null;
+  const [c, r] = list[(Math.random() * list.length) | 0];
+  dots[r][c] = v;
+  return { c, r, t: SPECIAL_LIFE };
+}
+function spawnBolt() {
+  const list = [];
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) if (dots[r][c] === 1) list.push([c, r]);
+  if (!list.length) return false;
+  const [c, r] = list[(Math.random() * list.length) | 0];
+  dots[r][c] = 4; bolt = { c, r, t: 10 };
+  return true;
+}
+/* teleport Pac-Man to the tile farthest (by path) from every active ghost */
+function teleportPac() {
+  if (state !== 'playing' || paused || freeze > 0 || tele <= 0) return;
+  const dist = MAZE.map(row => Array.from(row, () => -1)), q = [];
+  const put = (c, r) => {
+    c = Math.max(0, Math.min(COLS - 1, c)); r = Math.max(0, Math.min(ROWS - 1, r));
+    if (!reach[r][c]) { c = 13; r = 11; }
+    if (dist[r][c] < 0) { dist[r][c] = 0; q.push([c, r]); }
+  };
+  ghosts.forEach(g => {
+    if (g.state === 'eyes' || g.state === 'entering') return;
+    if (g.state === 'house' || g.state === 'leaving') put(13, 11); else put(Math.round(g.x), Math.round(g.y));
+  });
+  if (!q.length) ghosts.forEach(g => put(Math.round(g.x), Math.round(g.y)));
+  for (let h = 0; h < q.length; h++) {
+    const [c, r] = q[h];
+    for (const d of DIRS) {
+      let nc = c + d.x, nr = r + d.y;
+      if (r === TUNNEL_ROW) { if (nc < 0) nc = COLS - 1; else if (nc >= COLS) nc = 0; }
+      if (c === PASS_COL) { if (nr < 0) nr = ROWS - 1; else if (nr >= ROWS) nr = 0; }
+      if (!inReach(nc, nr) || dist[nr][nc] >= 0) continue;
+      dist[nr][nc] = dist[r][c] + 1; q.push([nc, nr]);
+    }
+  }
+  let best = -1, cand = [];
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+    if (dist[r][c] < 0 || (wideTimer > 0 && !tileWide[r][c])) continue;
+    if (dist[r][c] > best) { best = dist[r][c]; cand = []; }
+    if (dist[r][c] === best) cand.push([c, r]);
+  }
+  if (!cand.length) return;
+  const [tc, tr] = cand[(Math.random() * cand.length) | 0];
+  fx.push({ x: pac.x, y: pac.y, t: 0 }, { x: tc, y: tr, t: 0 });
+  pac.x = tc; pac.y = tr; pac.dir = pacCanMove(tc, tr, pac.face) ? pac.face : NONE;
+  tele--; Sound.teleport();
+}
+function spawnPoison() {
+  const list = [];
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) if (dots[r][c] === 1) list.push([c, r]);
+  if (!list.length) return false;
+  const [c, r] = list[(Math.random() * list.length) | 0];
+  dots[r][c] = 3; poison = { c, r, t: POISON_LIFE };
+  Sound.poisonAlert(); popup(c, r, 'POISON!', '#39ff14');
+  return true;
+}
+
+function stepPlaying(dt) {
+  if (freeze > 0) { freeze -= dt; if (freeze <= 0) ghosts.forEach(g => g.eatenFreeze = false); return; }
+
+  playTime += dt;
+  // dots regrow, oldest first
+  while (regenQ.length && playTime - regenQ[0].t >= REGEN_TIME) {
+    const q = regenQ.shift();
+    if (!dots[q.r][q.c]) { dots[q.r][q.c] = q.v; born[q.r][q.c] = playTime; remaining++; }
+  }
+  // lanes re-randomize
+  laneTimer -= dt;
+  if (laneTimer <= 0) { laneTimer = LANE_EVERY; randomizeLanes(); Sound.lane(); popup(13.5, 17, 'LANES SHIFTED!', '#00ffcc'); }
+  // difficulty
+  levelTimer -= dt;
+  if (levelTimer <= 0) { levelTimer = LEVEL_EVERY; levelUp(); }
+  // poison dot
+  nextPoison -= dt;
+  if (poison) { poison.t -= dt; if (poison.t <= 0) { if (dots[poison.r][poison.c] === 3) dots[poison.r][poison.c] = 1; poison = null; } }
+  else if (nextPoison <= 0 && spawnPoison()) nextPoison = POISON_EVERY;
+  // lightning-bolt dot
+  nextBolt -= dt;
+  if (bolt) { bolt.t -= dt; if (bolt.t <= 0) { if (dots[bolt.r][bolt.c] === 4) dots[bolt.r][bolt.c] = 1; bolt = null; } }
+  else if (nextBolt <= 0 && spawnBolt()) nextBolt = 20 + Math.random() * 15;
+  // heart & snail dots
+  nextHeart -= dt; nextSnail -= dt;
+  if (heart) { heart.t -= dt; if (heart.t <= 0) { if (dots[heart.r][heart.c] === 5) dots[heart.r][heart.c] = 1; heart = null; } }
+  else if (nextHeart <= 0) { heart = spawnSpecial(5); if (heart) nextHeart = HEART_EVERY; }
+  if (snail) { snail.t -= dt; if (snail.t <= 0) { if (dots[snail.r][snail.c] === 6) dots[snail.r][snail.c] = 1; snail = null; } }
+  else if (nextSnail <= 0) { snail = spawnSpecial(6); if (snail) nextSnail = SNAIL_EVERY; }
+  nextSnow -= dt;
+  if (snow) { snow.t -= dt; if (snow.t <= 0) { if (dots[snow.r][snow.c] === 7) dots[snow.r][snow.c] = 1; snow = null; } }
+  else if (nextSnow <= 0) { snow = spawnSpecial(7); if (snow) nextSnow = SNOW_EVERY; }
+  if (slowTimer > 0) slowTimer = Math.max(0, slowTimer - dt);
+  if (iceTimer > 0) iceTimer = Math.max(0, iceTimer - dt);
+  // fat Pac
+  if (wideTimer > 0) wideTimer = Math.max(0, wideTimer - dt);
+  const tr = wideTimer > 0 ? PAC_R_WIDE : PAC_R_NORMAL;
+  pac.r += Math.sign(tr - pac.r) * Math.min(Math.abs(tr - pac.r), 14 * dt);
+
+  if (frightTimer > 0) { frightTimer -= dt; if (frightTimer <= 0) endFright(); }
+  else if (iceTimer <= 0) { modeTimer -= dt; if (modeTimer <= 0) nextMode(); }
+
+  if (iceTimer <= 0) releaseLogic(dt);
+  updatePac(dt);
+  if (iceTimer <= 0) ghosts.forEach(g => updateGhost(g, dt));      // frozen ghosts stay put
+
+  // sirens
+  Sound.fright(frightTimer > 0 && ghosts.some(g => g.frightened));
+  Sound.eyes(ghosts.some(g => g.state === 'eyes' || g.state === 'entering'));
+
+  // fruit
+  if (fruit) {
+    fruit.t -= dt;
+    if (fruit.t <= 0) fruit = null;
+    else if (Math.hypot(pac.x - fruit.x, pac.y - fruit.y) < 0.7) {
+      const pts = FRUIT_PTS[fruitIndex()]; addScore(pts); Sound.fruit();
+      popup(fruit.x, fruit.y, String(pts), '#ffb8ff'); fruit = null;
+    }
+  }
+
+  // ghost collisions
+  for (const g of ghosts) {
+    if (g.state === 'eyes' || g.state === 'entering' || g.state === 'house') continue;
+    if (iceTimer > 0 && !g.frightened) continue;                   // frozen ghosts are harmless
+    if (Math.hypot(g.x - pac.x, g.y - pac.y) < hitR()) {
+      if (g.frightened) { eatGhost(g); return; }
+      killPac(); return;
+    }
+  }
+}
+
+function update(dt) {
+  globalTime += dt; stateTime += dt;
+  for (let i = fx.length - 1; i >= 0; i--) { fx[i].t += dt; if (fx[i].t > 0.6) fx.splice(i, 1); }
+  for (let i = popups.length - 1; i >= 0; i--) { popups[i].t += dt; if (popups[i].t > 1.1) popups.splice(i, 1); }
+  switch (state) {
+    case 'ready':
+      if (stateTime >= readyDur) { state = 'playing'; stateTime = 0; firstReady = false; pac.dir = LEFT; pac.face = LEFT; Sound.startMusic(); }
+      break;
+    case 'playing': {
+      const n = Math.max(1, Math.ceil(dt / (1 / 60)));
+      for (let i = 0; i < n && state === 'playing'; i++) stepPlaying(dt / n);
+      break;
+    }
+    case 'dying':
+      if (stateTime >= 0.9 && !update.dsPlayed) { update.dsPlayed = true; Sound.death(); }
+      if (stateTime >= 3.0) {
+        update.dsPlayed = false;
+        if (lives > 0) { resetActors(); startReady(); }
+        else { state = 'gameover'; stateTime = 0; Sound.gameOver(); saveHi(); }
+      }
+      break;
+  }
+}
+
+/* =====================================================================
+   RENDERING
+   ===================================================================== */
+const px = x => (x + 0.5) * T;
+const py = y => (y + 0.5) * T + OFFY;
+const FONT = s => `bold ${s}px "Courier New", monospace`;
+
+function txt(s, x, y, color, size, align, glow) {
+  ctx.font = FONT(size); ctx.textAlign = align || 'left'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = color;
+  if (glow) { ctx.shadowColor = glow; ctx.shadowBlur = 10; }
+  ctx.fillText(s, x, y); ctx.shadowBlur = 0;
+}
+
+function drawPacPx(x, y, r, face, mouth, color) {
+  ctx.save(); ctx.translate(x, y);
+  ctx.rotate(face === RIGHT ? 0 : face === DOWN ? Math.PI / 2 : face === LEFT ? Math.PI : -Math.PI / 2);
+  ctx.fillStyle = color || '#ffe600';
+  ctx.beginPath(); ctx.moveTo(0, 0);
+  ctx.arc(0, 0, r, mouth, Math.PI * 2 - mouth); ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+function pacMouth() {
+  const ph = pac.anim % 1, o = ph < 0.5 ? ph * 2 : 2 - ph * 2;
+  return 0.04 + o * 0.85;
+}
+
+function drawGhostPx(x, y, r, color, look, frame, mode, flashOn) {
+  ctx.save(); ctx.translate(x, y);
+  if (mode !== 'e') {
+    ctx.fillStyle = mode === 'f' ? (flashOn ? '#ffffff' : '#2121ff') : color;
+    ctx.beginPath(); ctx.arc(0, -r * 0.1, r, Math.PI, 0);
+    const yb = r * 0.95, yu = r * 0.55, n = 6;
+    ctx.lineTo(r, yb);
+    for (let i = 1; i <= n; i++) ctx.lineTo(r - i * (2 * r / n), ((i + frame) % 2 === 0) ? yb : yu);
+    ctx.closePath(); ctx.fill();
+  }
+  if (mode === 'f') {
+    const fc = flashOn ? '#ff2020' : '#ffc8a8';
+    ctx.fillStyle = fc; ctx.strokeStyle = fc; ctx.lineWidth = 1.5;
+    ctx.fillRect(-r * 0.45, -r * 0.4, r * 0.24, r * 0.24); ctx.fillRect(r * 0.21, -r * 0.4, r * 0.24, r * 0.24);
+    ctx.beginPath(); ctx.moveTo(-r * 0.6, r * 0.4);
+    for (let i = 1; i <= 6; i++) ctx.lineTo(-r * 0.6 + i * r * 0.2, i % 2 ? r * 0.15 : r * 0.4);
+    ctx.stroke();
+  } else {
+    const lx = look.x * r * 0.14, ly = look.y * r * 0.14;
+    for (const sx of [-1, 1]) {
+      ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.ellipse(sx * r * 0.36 + lx * 0.4, -r * 0.25 + ly * 0.4, r * 0.27, r * 0.35, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#1a2bff'; ctx.beginPath(); ctx.arc(sx * r * 0.36 + lx * 1.5, -r * 0.25 + ly * 1.5, r * 0.15, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+  ctx.restore();
+}
+
+function drawFruitPx(kind, x, y, s) {
+  ctx.save(); ctx.translate(x, y); ctx.lineWidth = 1.5; ctx.lineCap = 'round';
+  const circ = (cx, cy, r, c) => { ctx.fillStyle = c; ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill(); };
+  switch (kind) {
+    case 0:
+      ctx.strokeStyle = '#6ab04c'; ctx.beginPath(); ctx.moveTo(-s * .4, s * .2); ctx.quadraticCurveTo(-s * .1, -s * .9, s * .5, -s * .8); ctx.moveTo(s * .4, s * .3); ctx.lineTo(s * .5, -s * .8); ctx.stroke();
+      circ(-s * .45, s * .45, s * .45, '#ff1f3d'); circ(s * .45, s * .5, s * .42, '#ff1f3d'); break;
+    case 1:
+      ctx.fillStyle = '#ff2d55'; ctx.beginPath(); ctx.moveTo(-s * .8, -s * .35); ctx.quadraticCurveTo(0, -s * .7, s * .8, -s * .35); ctx.quadraticCurveTo(s * .5, s * .8, 0, s); ctx.quadraticCurveTo(-s * .5, s * .8, -s * .8, -s * .35); ctx.fill();
+      ctx.fillStyle = '#fff'; [[-.3,0],[.3,0],[0,.35],[-.25,.5],[.25,.5]].forEach(p => ctx.fillRect(p[0] * s - 1, p[1] * s - 1, 2, 2));
+      ctx.fillStyle = '#4cd137'; ctx.fillRect(-s * .5, -s * .65, s, s * .3); break;
+    case 2:
+      circ(0, s * .15, s * .75, '#ff9f1a'); ctx.fillStyle = '#4cd137'; ctx.fillRect(-1, -s * .9, 3, s * .35); break;
+    case 3:
+      circ(-s * .22, s * .15, s * .55, '#ff2020'); circ(s * .22, s * .15, s * .55, '#ff2020');
+      ctx.fillStyle = '#4cd137'; ctx.beginPath(); ctx.ellipse(s * .3, -s * .55, s * .3, s * .15, -0.5, 0, Math.PI * 2); ctx.fill(); break;
+    case 4:
+      circ(0, 0, s * .8, '#7ddc3e'); ctx.strokeStyle = '#3c9a1e'; ctx.beginPath();
+      ctx.moveTo(-s * .5, -s * .5); ctx.lineTo(s * .5, s * .5); ctx.moveTo(s * .5, -s * .5); ctx.lineTo(-s * .5, s * .5); ctx.stroke(); break;
+    case 5:
+      ctx.fillStyle = '#ffe600'; ctx.beginPath(); ctx.moveTo(0, -s); ctx.lineTo(s * .9, -s * .1); ctx.lineTo(0, s * .3); ctx.lineTo(-s * .9, -s * .1); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = '#3a6bff'; ctx.fillRect(-s * .15, -s * .1, s * .3, s * 1.0); ctx.fillStyle = '#ff2020'; ctx.fillRect(-s * .5, -s * .5, s, s * .25); break;
+    case 6:
+      ctx.fillStyle = '#ffe14d'; ctx.beginPath(); ctx.moveTo(-s * .8, s * .6); ctx.quadraticCurveTo(-s * .8, -s * .9, 0, -s * .9); ctx.quadraticCurveTo(s * .8, -s * .9, s * .8, s * .6); ctx.closePath(); ctx.fill();
+      circ(0, s * .75, s * .22, '#fff'); break;
+    default:
+      ctx.strokeStyle = '#8ff'; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.arc(0, -s * .5, s * .38, 0, Math.PI * 2); ctx.moveTo(0, -s * .12); ctx.lineTo(0, s * .9);
+      ctx.moveTo(0, s * .55); ctx.lineTo(s * .45, s * .55); ctx.moveTo(0, s * .85); ctx.lineTo(s * .35, s * .85); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawHUD() {
+  const blink = state !== 'title' && Math.floor(globalTime * 2) % 2 === 0;
+  if (state === 'title' || blink || paused) txt('1UP', 36, 14, '#fff', 14, 'left');
+  txt(score ? String(score) : '00', 108, 32, '#fff', 14, 'right');
+  txt('HIGH SCORE', W / 2, 14, '#fff', 14, 'center');
+  txt(String(hi || 0), W / 2 + 40, 32, '#fff', 14, 'right');
+  if (state !== 'title') {
+    ctx.save(); ctx.fillStyle = tele > 0 ? '#ffff00' : '#555'; if (tele > 0) { ctx.shadowColor = '#ffff00'; ctx.shadowBlur = 8; }
+    boltPath(130, 33, 7); ctx.fill(); ctx.restore();
+    txt('x' + tele, 140, 33, tele > 0 ? '#ffff00' : '#777', 14, 'left');
+  }
+  txt('LEVEL', W - 14, 14, '#fff', 14, 'right');
+  txt(String(level), W - 14, 32, '#ffe600', 14, 'right');
+}
+function drawBottomHUD() {
+  const y = (HUD_TOP + ROWS) * T + 17;
+  const n = state === 'title' ? 3 : Math.max(0, lives);
+  for (let i = 0; i < n; i++) drawPacPx(26 + i * 28, y, 9, LEFT, 0.55);
+  for (let L = Math.max(1, level - 4); L <= level; L++) drawFruitPx(FRUIT_KIND[Math.min(L - 1, 12)], W - 20 - (level - L) * 28, y, 8);
+  if (state === 'title') { if (Sound.muted) txt('SOUND OFF', 200, y, '#7a7fa8', 11, 'center'); return; }
+  const lines = [];
+  if (wideTimer > 0) lines.push([`FAT PAC ${Math.ceil(wideTimer)}s`, '#7dff2a']);
+  else if (poison && Math.floor(globalTime * 4) % 2 === 0) lines.push([`POISON DOT ${Math.ceil(poison.t)}s`, '#39ff14']);
+  else if (poison) lines.push([`POISON DOT ${Math.ceil(poison.t)}s`, '#b6ff8a']);
+  lines.push(wideTimer > 0 ? ['FAT PAC: DOUBLE-DASH LANES ONLY', '#c8c8c8'] : null);
+  if (!lines[lines.length - 1]) lines.pop();
+  lines.push(laneTimer <= 5 && Math.floor(globalTime * 4) % 2 === 0 ? [`LANES SHIFT IN ${Math.ceil(laneTimer)}`, '#ff4040'] : [`LANES ${Math.ceil(laneTimer)}s`, '#7a8cff']);
+  if (iceTimer > 0) lines.push([`GHOSTS FROZEN ${Math.ceil(iceTimer)}s`, '#bfefff']);
+  if (slowTimer > 0) lines.push([`GHOSTS SLOWED ${Math.ceil(slowTimer)}s`, '#b8e08a']);
+  if (Sound.muted && lines.length < 3) lines.push(['SOUND OFF', '#7a7fa8']);
+  const step = lines.length > 3 ? 9.5 : lines.length > 2 ? 11 : 14, y0 = (HUD_TOP + ROWS) * T + 16 - (lines.length - 1) * step / 2;
+  lines.forEach((l, k) => txt(l[0], 200, y0 + k * step, l[1], 10, 'center'));
+}
+
+function boltPath(x, y, s) {
+  ctx.beginPath();
+  [[0.4,-1],[-0.5,0.1],[0,0.1],[-0.3,1],[0.55,-0.25],[0.05,-0.25]].forEach((p, i) => i ? ctx.lineTo(x + p[0] * s, y + p[1] * s) : ctx.moveTo(x + p[0] * s, y + p[1] * s));
+  ctx.closePath();
+}
+function drawHeart(x, y) {
+  const t = globalTime;
+  if (heart && heart.t < 3 && Math.floor(t * 10) % 2 === 0) return;
+  ctx.save();
+  for (let k = 0; k < 5; k++) {                           // rising red fumes
+    const ph = (t * 0.8 + k / 5) % 1;
+    ctx.globalAlpha = (1 - ph) * 0.6; ctx.fillStyle = '#ff4060';
+    ctx.beginPath(); ctx.arc(x + Math.sin(ph * 7 + k * 2) * 4, y - 3 - ph * 17, 1.6 + ph * 3.6, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1; ctx.shadowColor = '#ff2d55'; ctx.shadowBlur = 14; ctx.fillStyle = '#ff2d55';
+  const s = 5.2 * (1 + 0.2 * Math.sin(t * 9));
+  ctx.beginPath(); ctx.moveTo(x, y + s * 0.95);
+  ctx.bezierCurveTo(x + s * 1.7, y - s * 0.1, x + s * 0.95, y - s * 1.15, x, y - s * 0.4);
+  ctx.bezierCurveTo(x - s * 0.95, y - s * 1.15, x - s * 1.7, y - s * 0.1, x, y + s * 0.95);
+  ctx.fill(); ctx.shadowBlur = 0; ctx.fillStyle = 'rgba(255,255,255,0.75)'; ctx.beginPath(); ctx.arc(x - s * 0.5, y - s * 0.35, s * 0.2, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+}
+function drawSnowflake(x, y) {
+  const t = globalTime;
+  if (snow && snow.t < 3 && Math.floor(t * 10) % 2 === 0) return;
+  ctx.save();
+  for (let k = 0; k < 5; k++) {                           // rising white fumes
+    const ph = (t * 0.8 + k / 5) % 1;
+    ctx.globalAlpha = (1 - ph) * 0.65; ctx.fillStyle = '#ffffff';
+    ctx.beginPath(); ctx.arc(x + Math.sin(ph * 7 + k * 2) * 4, y - 3 - ph * 17, 1.6 + ph * 3.6, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1; ctx.shadowColor = '#9fe8ff'; ctx.shadowBlur = 14;
+  ctx.strokeStyle = '#c8f3ff'; ctx.lineWidth = 1.7; ctx.lineCap = 'round';
+  const L = 6.6 * (1 + 0.12 * Math.sin(t * 8));
+  ctx.translate(x, y); ctx.rotate(t * 0.6);
+  ctx.beginPath();
+  for (let k = 0; k < 6; k++) {
+    const a = k * Math.PI / 3, ca = Math.cos(a), sa = Math.sin(a);
+    ctx.moveTo(0, 0); ctx.lineTo(ca * L, sa * L);
+    for (const b of [-0.6, 0.6]) {                          // little branches
+      const bx = ca * L * 0.6, by = sa * L * 0.6, aa = a + b;
+      ctx.moveTo(bx, by); ctx.lineTo(bx + Math.cos(aa) * L * 0.38, by + Math.sin(aa) * L * 0.38);
+    }
+  }
+  ctx.stroke(); ctx.restore();
+}
+function drawSnail(x, y) {
+  if (snail && snail.t < 3 && Math.floor(globalTime * 10) % 2 === 0) return;
+  const bob = Math.sin(globalTime * 4) * 0.8;
+  ctx.save(); ctx.translate(x, y + bob); ctx.shadowColor = 'rgba(255,255,255,0.6)'; ctx.shadowBlur = 6;
+  ctx.fillStyle = '#b8e08a';                               // body
+  ctx.beginPath(); ctx.ellipse(0.5, 3.4, 6.6, 2.3, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(5.6, 1.6, 2.3, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = '#b8e08a'; ctx.lineWidth = 1; ctx.beginPath();   // antennae
+  ctx.moveTo(5.8, 0); ctx.lineTo(7.2, -3.2); ctx.moveTo(4.6, 0.2); ctx.lineTo(4.4, -3.4); ctx.stroke();
+  ctx.shadowBlur = 0; ctx.fillStyle = '#222'; ctx.beginPath(); ctx.arc(6.2, 1.2, 0.6, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#d98a3d'; ctx.beginPath(); ctx.arc(-1, -0.8, 4.6, 0, Math.PI * 2); ctx.fill();   // shell
+  ctx.strokeStyle = '#7a3f12'; ctx.lineWidth = 1; ctx.beginPath();
+  for (let a = 0; a < 9; a += 0.25) { const r = 0.4 + a * 0.45; const px_ = -1 + Math.cos(a) * r, py_ = -0.8 + Math.sin(a) * r; a ? ctx.lineTo(px_, py_) : ctx.moveTo(px_, py_); }
+  ctx.stroke(); ctx.restore();
+}
+function drawBoltDot(x, y) {
+  if (bolt && bolt.t < 3 && Math.floor(globalTime * 10) % 2 === 0) return;
+  ctx.save();
+  ctx.shadowColor = '#ffff00'; ctx.shadowBlur = 14;
+  ctx.fillStyle = Math.floor(globalTime * 9) % 2 ? '#ffff00' : '#ffffff';
+  boltPath(x, y, 7.5 + Math.sin(globalTime * 14)); ctx.fill();
+  ctx.restore();
+}
+function drawPoison(x, y) {
+  const t = globalTime;
+  if (poison && poison.t < 3 && Math.floor(t * 10) % 2 === 0) return;
+  ctx.save();
+  for (let k = 0; k < 5; k++) {                           // rising fumes
+    const ph = (t * 0.8 + k / 5) % 1;
+    ctx.globalAlpha = (1 - ph) * 0.6; ctx.fillStyle = '#8dff3a';
+    ctx.beginPath(); ctx.arc(x + Math.sin(ph * 7 + k * 2) * 4, y - 2 - ph * 17, 1.6 + ph * 3.6, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1; ctx.shadowColor = '#39ff14'; ctx.shadowBlur = 14; ctx.fillStyle = '#39ff14';
+  ctx.beginPath(); ctx.arc(x, y, 4.2 * (1 + 0.25 * Math.sin(t * 12)), 0, Math.PI * 2); ctx.fill();
+  ctx.shadowBlur = 0; ctx.fillStyle = '#eaffd0'; ctx.beginPath(); ctx.arc(x - 1, y - 1, 1.4, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+}
+function drawDots() {
+  const pelletOn = Math.floor(globalTime * 3.5) % 2 === 0 || state === 'title' || paused;
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+    const v = dots[r][c]; if (!v) continue;
+    const age = playTime - born[r][c], sc = age < 0.4 ? 0.3 + 0.7 * (age / 0.4) : 1;
+    ctx.fillStyle = '#ffb8ae';
+    if (v === 1) { const w = 3.2 * sc; ctx.fillRect(px(c) - w / 2, py(r) - w / 2, w, w); }
+    else if (v === 2) { if (pelletOn) { ctx.beginPath(); ctx.arc(px(c), py(r), 5.6 * sc, 0, Math.PI * 2); ctx.fill(); } }
+    else if (v === 3) drawPoison(px(c), py(r));
+    else if (v === 4) drawBoltDot(px(c), py(r));
+    else if (v === 5) drawHeart(px(c), py(r));
+    else if (v === 6) drawSnail(px(c), py(r));
+    else drawSnowflake(px(c), py(r));
+  }
+}
+
+function drawGhosts() {
+  const frame = Math.floor(globalTime * 8) % 2;
+  for (const g of ghosts) {
+    if (g.eatenFreeze) continue;
+    let mode = 'n', flashOn = false;
+    if (g.state === 'eyes' || g.state === 'entering') mode = 'e';
+    else if (g.frightened) { mode = 'f'; flashOn = frightTimer < 1.5 && Math.floor(frightTimer * 6) % 2 === 0; }
+    drawGhostPx(px(g.x), py(g.y), T * 0.5, g.color, g.look || LEFT, frame, mode, flashOn);
+    if (iceTimer > 0 && mode !== 'e' && (iceTimer > ICE_FLASH || Math.floor(iceTimer * 8) % 2 === 0)) {   // ice shell (flashes at the end)
+      const r = T * 0.5 * 1.15; ctx.save(); ctx.translate(px(g.x), py(g.y));
+      ctx.fillStyle = 'rgba(160,228,255,0.6)'; ctx.strokeStyle = '#eafcff'; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(0, -r * 0.1, r, Math.PI, 0); ctx.lineTo(r, r * 0.95); ctx.lineTo(-r, r * 0.95); ctx.closePath(); ctx.fill(); ctx.stroke();
+      ctx.restore();
+    }
+  }
+}
+
+function drawPacman() {
+  const R = pac.r;
+  if (state === 'dying') {
+    if (stateTime < 0.9) { drawPacPx(px(pac.x), py(pac.y), R, pac.face, 0.05); return; }
+    const p = Math.min(1, (stateTime - 0.9) / 1.5);
+    if (p >= 1) return;
+    ctx.save(); ctx.translate(px(pac.x), py(pac.y)); ctx.rotate(-Math.PI / 2);
+    ctx.fillStyle = '#ffe600'; ctx.beginPath(); ctx.moveTo(0, 0);
+    const a = 0.05 + p * (Math.PI - 0.05);
+    ctx.arc(0, 0, R, a, Math.PI * 2 - a); ctx.closePath(); ctx.fill(); ctx.restore();
+    return;
+  }
+  const mouth = state === 'playing' && pac.dir !== NONE ? pacMouth() : (state === 'playing' ? 0.3 : 0.05);
+  ctx.save();
+  if (wideTimer > 0) {
+    ctx.shadowColor = '#39ff14'; ctx.shadowBlur = 12;
+    if (wideTimer < WIDE_FLASH && Math.floor(wideTimer * 6) % 2 === 0) ctx.globalAlpha = 0.3;
+  }
+  drawPacPx(px(pac.x), py(pac.y), R, pac.face, mouth, wideTimer > 0 ? '#a6ff2e' : '#ffe600');
+  ctx.restore();
+}
+
+function drawTitle() {
+  ctx.fillStyle = 'rgba(0,0,0,0.88)'; ctx.fillRect(0, OFFY, W, ROWS * T);
+  txt('PAC-MAN', W / 2, 128, '#ffe600', 56, 'center', '#ffaa00');
+  txt('RETRO ARCADE TRIBUTE', W / 2, 170, '#00ffff', 13, 'center');
+  const rows = [['BLINKY', '"SHADOW"'], ['PINKY', '"SPEEDY"'], ['INKY', '"BASHFUL"'], ['CLYDE', '"POKEY"']];
+  rows.forEach((rw, i) => {
+    const y = 222 + i * 34, g = ghosts[i];
+    drawGhostPx(112, y, 11, g.color, RIGHT, Math.floor(globalTime * 8) % 2, 'n', false);
+    txt(rw[0], 140, y, g.color, 16, 'left');
+    txt(rw[1], 250, y, '#8a90b8', 14, 'left');
+  });
+  ctx.fillStyle = '#ffb8ae'; ctx.fillRect(116, 372 - 1.6, 3.2, 3.2);
+  txt('10', 132, 372, '#fff', 13, 'left');
+  ctx.beginPath(); ctx.arc(190, 372, 5.6, 0, Math.PI * 2); ctx.fill();
+  txt('50', 202, 372, '#fff', 13, 'left');
+  txt('GHOSTS 200·400·800·1600', 250, 372, '#8a90b8', 11, 'left');
+  txt('GREEN POISON DOT = FAT PAC · 2 DASHES = WIDE LANE', W / 2, 398, '#7dff2a', 11, 'center');
+  txt('LANES SHIFT EVERY MINUTE · DOTS REGROW AFTER 10s', W / 2, 414, '#8a90b8', 11, 'center');
+  txt('YELLOW BOLT DOT = +1 TELEPORT (SPACE)', W / 2, 430, '#ffff40', 11, 'center');
+  txt('HEART = +1 LIFE   SNAIL = SLOWS GHOSTS', W / 2, 446, '#ff8aa0', 11, 'center');
+  txt('SNOWFLAKE = FREEZES GHOSTS (5s)', W / 2, 462, '#bfefff', 11, 'center');
+  // little chase animation
+  const span = W + 220, off = (globalTime * 95) % span - 110;
+  drawPacPx(off, 484, 10, RIGHT, 0.04 + Math.abs(Math.sin(globalTime * 11)) * 0.75);
+  ghosts.forEach((g, i) => drawGhostPx(off - 34 - i * 28, 484, 10.5, g.color, RIGHT, Math.floor(globalTime * 8 + i) % 2, 'n', false));
+  if (Math.floor(globalTime * 2) % 2 === 0) txt('PRESS ENTER OR CLICK TO START', W / 2, 508, '#fff', 15, 'center');
+  txt('ARROWS / WASD  MOVE', W / 2, 518, '#8a90b8', 12, 'center');
+  txt('SPACE TELEPORT   P PAUSE   M MUTE', W / 2, 536, '#8a90b8', 12, 'center');
+}
+
+function drawOverlays() {
+  const cy = py(17), cyp = py(11);
+  if (state === 'ready') {
+    if (firstReady) txt('PLAYER ONE', W / 2, cyp, '#00ffff', 15, 'center');
+    txt('READY!', W / 2, cy, '#ffe600', 15, 'center');
+  } else if (state === 'gameover') {
+    if (stateTime < 2.5) txt('GAME OVER', W / 2, cy, '#ff2020', 15, 'center');
+    else {
+      ctx.fillStyle = 'rgba(0,0,0,0.85)'; ctx.fillRect(0, OFFY, W, ROWS * T);
+      txt('GAME OVER', W / 2, 190, '#ff2020', 40, 'center', '#ff0000');
+      txt('SCORE ' + score, W / 2, 262, '#fff', 20, 'center');
+      txt('HIGH SCORE ' + hi, W / 2, 296, '#ffe600', 16, 'center');
+      if (score > 0 && score >= hi) txt('NEW HIGH SCORE!', W / 2, 332, '#00ffff', 16, 'center');
+      txt('LEVEL REACHED ' + level, W / 2, 366, '#8a90b8', 13, 'center');
+      if (Math.floor(globalTime * 2) % 2 === 0) txt('PRESS ENTER OR CLICK TO PLAY AGAIN', W / 2, 430, '#fff', 14, 'center');
+    }
+  }
+  for (const p of popups) {
+    const a = Math.max(0, 1 - Math.max(0, p.t - 0.7) / 0.4);
+    ctx.globalAlpha = a; txt(p.text, px(p.x), py(p.y) - p.t * 6, p.color, 12, 'center'); ctx.globalAlpha = 1;
+  }
+  if (paused) {
+    ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(0, OFFY, W, ROWS * T);
+    txt('PAUSED', W / 2, H / 2 - 12, '#ffe600', 34, 'center', '#ffaa00');
+    txt('PRESS P TO RESUME', W / 2, H / 2 + 24, '#fff', 13, 'center');
+  }
+}
+
+function render() {
+  ctx.setTransform(SCALE, 0, 0, SCALE, 0, 0);
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  drawHUD();
+  ctx.drawImage(wallsBlue, 0, OFFY, W, ROWS * T);
+  ctx.drawImage(laneCanvas, 0, OFFY, W, ROWS * T);
+  if (state !== 'gameover' || stateTime < 2.5) drawDots();
+  if (state === 'title') { drawTitle(); drawBottomHUD(); return; }
+  ctx.save(); ctx.beginPath(); ctx.rect(0, OFFY, W, ROWS * T); ctx.clip();
+  if (fruit) drawFruitPx(fruitIndex() <= 12 ? FRUIT_KIND[fruitIndex()] : 7, px(fruit.x), py(fruit.y), 8);
+  const showGhosts = state === 'ready' || state === 'playing' || (state === 'dying' && stateTime < 0.9);
+  if (state !== 'gameover') drawPacman();
+  if (showGhosts) drawGhosts();
+  ctx.restore();
+  for (const f of fx) {
+    const k = f.t / 0.6; ctx.save(); ctx.globalAlpha = 1 - k; ctx.strokeStyle = '#ffff66'; ctx.lineWidth = 2.5; ctx.shadowColor = '#ffff00'; ctx.shadowBlur = 10;
+    ctx.beginPath(); ctx.arc(px(f.x), py(f.y), 4 + k * 24, 0, Math.PI * 2); ctx.stroke(); ctx.restore();
+  }
+  drawOverlays();
+  drawBottomHUD();
+}
+
+/* =====================================================================
+   MAIN LOOP
+   ===================================================================== */
+randomizeLanes();
+let last = performance.now();
+function frame(now) {
+  let dt = (now - last) / 1000; last = now;
+  if (dt > 0.1) dt = 0.1;
+  if (dt < 0) dt = 0;
+  if (!paused) update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
