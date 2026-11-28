@@ -13,7 +13,7 @@
 </head>
 <body>
 <canvas id="game" width="448" height="576" tabindex="0"></canvas>
-<div id="help">ARROWS / WASD MOVE &nbsp;·&nbsp; P PAUSE &nbsp;·&nbsp; SPACE TELEPORT &nbsp;·&nbsp; M MUTE &nbsp;·&nbsp; ENTER START</div>
+<div id="help">ARROWS / WASD MOVE &nbsp;·&nbsp; P PAUSE &nbsp;·&nbsp; SPACE OR DOUBLE-TAP TELEPORT &nbsp;·&nbsp; M MUTE &nbsp;·&nbsp; ENTER START</div>
 <script>
 (() => {
 'use strict';
@@ -567,19 +567,27 @@ window.addEventListener('blur', () => { held.length = 0; if (state === 'playing'
 document.addEventListener('visibilitychange', () => { if (document.hidden && !paused && state !== 'title' && state !== 'gameover') togglePause(); });
 window.addEventListener('beforeunload', saveHi);
 
-let touch = null;
+let touch = null, lastTap = null;
 canvas.addEventListener('pointerdown', e => {
-  touch = { x: e.clientX, y: e.clientY, done: false };
+  touch = { x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY, t0: performance.now(), done: false, swiped: false, live: state === 'playing' && !paused && e.pointerType !== 'mouse' };
   if (paused) togglePause(); else activate();
 });
 canvas.addEventListener('pointermove', e => {
   if (!touch || touch.done || e.pointerType === 'mouse') return;
   const dx = e.clientX - touch.x, dy = e.clientY - touch.y;
   if (Math.hypot(dx, dy) < 18) return;
+  touch.swiped = true;
   pressDir(Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? RIGHT : LEFT) : (dy > 0 ? DOWN : UP));
   touch.x = e.clientX; touch.y = e.clientY;
 });
-window.addEventListener('pointerup', () => { touch = null; });
+window.addEventListener('pointerup', e => {                  // double tap (touch/pen) = teleport, same as SPACE
+  const tp = touch; touch = null;
+  if (!tp || !tp.live || tp.swiped || performance.now() - tp.t0 > 300 || Math.hypot(e.clientX - tp.x0, e.clientY - tp.y0) > 24) { lastTap = null; return; }
+  const now = performance.now();
+  if (lastTap && now - lastTap.t < 350 && Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y) < 60) {
+    lastTap = null; if (state === 'playing' && !paused) teleportPac();
+  } else lastTap = { t: now, x: e.clientX, y: e.clientY };
+});
 
 /* =====================================================================
    MOVEMENT CORE
@@ -1370,7 +1378,7 @@ function drawTitle() {
   txt('GHOSTS 200·400·800·1600', 250, 372, '#8a90b8', 11, 'left');
   txt('GREEN POISON DOT = FAT PAC · 2 DASHES = WIDE LANE', W / 2, 398, '#7dff2a', 11, 'center');
   txt('LANES SHIFT EVERY MINUTE · DOTS REGROW AFTER 10s', W / 2, 414, '#8a90b8', 11, 'center');
-  txt('YELLOW BOLT DOT = +1 TELEPORT (SPACE)', W / 2, 430, '#ffff40', 11, 'center');
+  txt('YELLOW BOLT DOT = +1 TELEPORT (SPACE / DOUBLE TAP)', W / 2, 430, '#ffff40', 11, 'center');
   txt('HEART = +1 LIFE   SNAIL = SLOWS GHOSTS', W / 2, 446, '#ff8aa0', 11, 'center');
   txt('SNOWFLAKE = FREEZE   GOLD = ELECTRIC PAC', W / 2, 462, '#ffe27a', 11, 'center');
   // little chase animation
@@ -1379,7 +1387,7 @@ function drawTitle() {
   ghosts.forEach((g, i) => drawGhostPx(off - 34 - i * 28, 484, 10.5, g.color, RIGHT, Math.floor(globalTime * 8 + i) % 2, 'n', false));
   if (Math.floor(globalTime * 2) % 2 === 0) txt('PRESS ENTER OR CLICK TO START', W / 2, 508, '#fff', 15, 'center');
   txt('ARROWS / WASD  MOVE', W / 2, 518, '#8a90b8', 12, 'center');
-  txt('SPACE TELEPORT   P PAUSE   M MUTE', W / 2, 536, '#8a90b8', 12, 'center');
+  txt('SPACE / DOUBLE-TAP TELEPORT   P PAUSE   M MUTE', W / 2, 536, '#8a90b8', 12, 'center');
 }
 
 function drawOverlays() {
